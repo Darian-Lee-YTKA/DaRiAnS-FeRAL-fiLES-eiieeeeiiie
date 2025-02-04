@@ -1,0 +1,227 @@
+import torch
+from torch import nn
+from attention import EncoderLayers, DecoderLayers, CrossAttentionBlock
+from dataset import semeval_train_dataset
+
+seed = 27
+torch.manual_seed(seed)
+
+# Determine if GPU available
+if torch.cuda.is_available():
+    device = torch.device("cuda:2")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+
+class PositionalEmbedding(nn.Module):
+    """
+    Takes in an embedded input and outputs the sum of the positional representations and the learned semantic embeddings
+
+    In the case of entity embeddings, it takes in embedded entity tokens and returns the sum of the semantic embeddings
+    and positional embeddings. The positional embeddings will be based only on the entity. So "Be yon ce" will have 3 positions,
+    even if the actual occurance of this word occurs 12 indexes into a larger sentence
+
+    entity positional and semabtic embeddings will be seperate objects from those of normal words, but they will use the same class
+
+    """
+
+    def __init__(self, n_embd, max_len=5000):
+        super().__init__()
+        self.pos_embedding = nn.Embedding(max_len, n_embd)
+
+    def forward(self, x):
+        # .view() ensures the correct tensor shape
+        pos = torch.arange(x.size(1), device=x.device).view(1, x.size(1))
+        embedding = self.pos_embedding(pos)
+        return x + embedding
+
+
+class TransformerEncoder(nn.Module):
+    """
+    No masking for self-attention
+    """
+
+    def __init__(self, vocab_size, n_embd, n_head, n_layer, max_seq_len, max_entity_len):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, n_embd)
+        self.pos_embedding = PositionalEmbedding(n_embd, max_seq_len)
+
+        self.entity_embedding = nn.Embedding(vocab_size, n_embd)
+        self.entity_pos_embedding = PositionalEmbedding(n_embd, max_entity_len)
+
+        # Note: here I code embeddings and entity embeddings separately, although you could also have them use the
+        # same embeddings
+        # pros of separating them: allows the model to optimize the embeddings for specific entity
+        # info. For example, maybe attention will work better if the model optimizes these parameters separately in
+        # such a way that it "tags" them as entities in their embeddings rather than just embedding them as normal words
+        #
+        # cons of separating them: more parameters, slower convergence, and potential fragmentation of representations,
+        # where entity embeddings and word embeddings might not integrate well
+        #
+        # based on these pros and cons, I still think separating them is the better approach, but we can certainly
+        # experiment with both if needed
+
+        self.attention_layers = nn.ModuleList(
+            [CrossAttentionBlock(n_embd, n_head) for _ in range(n_layer)]
+        )
+
+    def forward(self, x, entity_info=None):
+        """
+        Args:
+            x (batch size, seq_len): Input sentences
+            entity_info (batch size, entity len): Encoded entity embeddings
+        Returns:
+            Hidden states from Encoder
+        Notes: 
+            - This code implies that we will need to write a seperate function for generating embeddings for the entity information
+            - Entity info should have shape (entity_seq_len, embedding dim)
+        """
+        if entity_info is not None:
+            pad_mask = (torch.cat((entity_info, x), dim=1) == semeval_train_dataset.vocab["<PAD>"])
+        else:
+            pad_mask = (x == semeval_train_dataset.vocab["<PAD>"])
+
+        encoder_inputs = x
+        x = x.long() # should already be long but just an extra check
+        x = self.embedding(x)
+        x = self.pos_embedding(x)
+
+        entity_embeddings = self.entity_embedding(entity_info) if entity_info is not None else None
+        entity_embeddings = self.entity_pos_embedding(entity_embeddings) if entity_embeddings is not None else None
+
+        # Mimics PyTorch's TransformerEncoder
+        for attention_layer in self.attention_layers:
+            # if entity info is provided, it will do cross attention using x + entity info as the keys and values and x as the query
+            # if no info is provided, it will just do normal self attention
+            x = attention_layer(x, x, pad_mask=pad_mask, entity_embeddings=entity_embeddings)
+
+        return x, entity_embeddings, encoder_inputs
+
+    
+
+class TransformerDecoder(nn.Module):
+    """
+    Requires masking for self-attention
+    """
+
+    def __init__(self, max_seq_length, n_embd, n_head, vocab_size, max_entity_len, attention_layers=5):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, n_embd)  # will give us token embeddings
+        self.pos_embedding = PositionalEmbedding(n_embd,
+                                                     max_seq_length)
+        self.last_linear_layer = nn.Linear(n_embd, vocab_size)
+
+        self.self_attention_layers = nn.ModuleList(
+            [DecoderLayers(n_embd, n_head) for _ in range(attention_layers)]
+        )
+        self.cross_attention_layers = nn.ModuleList(
+            [CrossAttentionBlock(n_embd, n_head) for _ in range(attention_layers)]
+        )
+
+        # separate entity embeddings for just the decoder
+        self.entity_embedding = nn.Embedding(vocab_size, n_embd)  # will give us token embeddings
+        self.entity_pos_embedding = PositionalEmbedding(n_embd, max_entity_len)
+
+    def forward(self, decoder_input, encoder_output, encoder_inputs, encoder_entity_embeddings=None, entity_info=None,
+                use_encoders_entities=False, entities_in_self_attn=True, entity_info_for_pad_mask= None):
+        """
+        Uses cross-attention and self-attention
+        Args:
+            decoder_input (batch size, seq_len): Input to Decoder
+            encoder_output (batch_size, seq_len, embedding dim): hidden states of encoder. Used in cross attention with decoder
+            encoder_entity_embeddings (batch_size, entity_seq_len, embedding dim): The trained entity embeddings from the encoder
+            entity_info (entity_seq_length): The unprocessed encoded entity tokens. These will be used to make a separate entity representation in the decoder
+            use_encoders_entities (bool): Describes whether we want to reuse the entity embeddings from the encoder or create new ones
+        Returns:
+            Translated Sentence (batch_size, seq_len, vocab_size)
+        Notes:
+            this code allows for the option to either use the encoders entity embeddings or generate those specific to the decoder by setting
+            use_encoders_entities to true or false respectively.
+
+            If use_encoders_entities = true, the model will use the same entity embeddings as used in the encoder and will
+            ignore entity_info (which is the raw, unembedded entities)
+
+            If use_encoders_entities = false, the model will ignore the encoder_entity_embeddings and
+            will construct its own embeddings using entity_info (which is the raw, unembedded entities)
+
+            Thus, this parameter allows us to easily switch between approaches for experimentation.
+
+            I think we should experiment with both approaches to see which yeilds
+            better results
+        """
+        seq_len = decoder_input.size(1)
+        if entity_info is not None:
+            entity_len = entity_info.size(1)
+
+        # embedd the decoder input 
+        decoder_input = decoder_input.long() 
+        x = self.embedding(decoder_input)  # batch, seq len, embedding size
+        
+
+        x = self.pos_embedding(x)
+
+        if entity_info != None and use_encoders_entities is False:
+
+            entity_embeddings = self.entity_embedding(entity_info)
+            entity_embeddings = self.entity_pos_embedding(entity_embeddings)
+
+        elif encoder_entity_embeddings != None and use_encoders_entities is True:
+            # if use_encoders_entities is True, then we use the same entities as the encoder
+            entity_embeddings = encoder_entity_embeddings
+            
+        else:
+            entity_embeddings = None 
+
+        # pass through self-attention layers
+        if entities_in_self_attn == True: 
+            for self_attn_block in self.self_attention_layers:
+                if entity_info is not None:
+                    pad_mask = (torch.cat((entity_info, decoder_input), dim=1) == semeval_train_dataset.vocab["<PAD>"])
+                else:
+                    pad_mask = (decoder_input == semeval_train_dataset.vocab["<PAD>"])
+                x = self_attn_block(x, pad_mask, entity_embeddings)
+
+        else:
+            for self_attn_block in self.self_attention_layers:
+                pad_mask = (decoder_input == semeval_train_dataset.vocab["<PAD>"])
+                x = self_attn_block(x, pad_mask, entity_embeddings=None)
+
+    
+        # pass through cross-attention layers
+        for cross_attn_block in self.cross_attention_layers:
+            if entity_info_for_pad_mask is not None:
+                pad_mask = (torch.cat((entity_info_for_pad_mask, encoder_inputs), dim=1) == semeval_train_dataset.vocab["<PAD>"])
+            else:
+                pad_mask = (encoder_inputs == semeval_train_dataset.vocab["<PAD>"])
+            #print("encoder inputs shape = ", encoder_inputs.shape)
+            #print("entity shape = ", entity_info_for_pad_mask.shape)
+            #print("pad mask shape = ", pad_mask.shape)
+            x = cross_attn_block(x, encoder_output, pad_mask, entity_embeddings)
+
+        # final linear layer to map to vocab size
+        output = self.last_linear_layer(x)  # (batch_size, seq_len, vocab_size)
+
+        return output
+    def generate(self, decoder_input, encoder_output, encoder_inputs, encoder_entity_embeddings=None, entity_info=None,
+                use_encoders_entities=False, entities_in_self_attn=True):
+        
+        device = encoder_output.device
+        generated_tokens = [lang_token] 
+        decoder_input = torch.tensor([generated_tokens], device=device)
+
+        for _ in range(max_length):
+            
+            logits = self.forward(decoder_input, encoder_output, encoder_input, encoder_entity_embeddings=None, entity_info=None,
+                use_encoders_entities=False, entities_in_self_attn=Trues)
+            next_token_logits = logits[:, -1, :]  
+            next_token_id = next_token_logits.argmax(dim=-1).item()  
+
+            if next_token_id == semeval_train_dataset.vocab["</s>"]:
+                break  
+
+            generated_tokens.append(next_token_id)
+            decoder_input = torch.tensor([generated_tokens], device=device)  
+
+        return generated_tokens
